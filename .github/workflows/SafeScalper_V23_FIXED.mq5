@@ -232,14 +232,14 @@ void OnTick()
    if(current_atr <= 0) return; // CRITICAL: Prevent division by zero
    
    // Manage existing positions
-   if(PositionsTotal() > 0)
+   int own_positions = CountOwnPositions();
+   if(own_positions > 0)
    {
       ManageOpenPositions(current_atr);
-      return; // Don't open new trades while managing
    }
    
    // Check max positions limit
-   if(CountOwnPositions() >= InpMaxPositions) return;
+   if(own_positions >= InpMaxPositions) return;
    
    // Get indicator data with VALIDATION
    if(CopyBuffer(h_ema_fast, 0, 0, 3, buf_ema_fast) < 3) return;
