@@ -114,6 +114,58 @@ double g_total_loss = 0;
 // File handle for logging
 int g_log_handle = INVALID_HANDLE;
 
+// Cached symbol properties (performance)
+double g_min_volume = 0.0;
+double g_max_volume = 0.0;
+double g_volume_step = 0.0;
+double g_tick_value = 0.0;
+string g_news_currency = "";
+
+//+------------------------------------------------------------------+
+//| Cache symbol properties (performance)                            |
+//+------------------------------------------------------------------+
+void RefreshSymbolCache()
+{
+   g_min_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   g_max_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   g_volume_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   g_tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+}
+
+//+------------------------------------------------------------------+
+//| Prepare news currency once per symbol                            |
+//+------------------------------------------------------------------+
+void InitNewsCurrency()
+{
+   g_news_currency = "";
+   if(StringLen(_Symbol) >= 6)
+      g_news_currency = StringSubstr(_Symbol, 0, 3); // EUR from EURUSD
+
+   // Handle special symbols
+   if(StringFind(_Symbol, "XAU") >= 0 || StringFind(_Symbol, "GOLD") >= 0)
+      g_news_currency = "USD";
+   if(StringFind(_Symbol, "BTC") >= 0 || StringFind(_Symbol, "ETH") >= 0)
+      g_news_currency = "USD";
+}
+
+//+------------------------------------------------------------------+
+//| Ensure log file handle is open                                   |
+//+------------------------------------------------------------------+
+bool EnsureLogHandle()
+{
+   if(!InpPrintLog) return false;
+
+   if(g_log_handle == INVALID_HANDLE)
+   {
+      g_log_handle = FileOpen(InpLogFile, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+      if(g_log_handle == INVALID_HANDLE)
+         return false;
+      FileSeek(g_log_handle, 0, SEEK_END);
+   }
+
+   return true;
+}
+
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
@@ -127,6 +179,8 @@ int OnInit()
    
    m_symbol.Name(_Symbol);
    m_symbol.RefreshRates();
+   RefreshSymbolCache();
+   InitNewsCurrency();
    
    // Initialize FTMO tracking
    g_initial_balance = m_account.Balance();
@@ -157,18 +211,17 @@ int OnInit()
    ArraySetAsSeries(buf_atr, true);
    ArraySetAsSeries(buf_rsi, true);
    
-   // Open log file
+   // Open log file (keep handle open for performance)
    if(InpPrintLog)
    {
-      string filename = InpLogFile;
-      g_log_handle = FileOpen(filename, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+      g_log_handle = FileOpen(InpLogFile, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
       if(g_log_handle != INVALID_HANDLE)
       {
          FileWrite(g_log_handle, "=== SafeScalper V23 Started ===");
          FileWrite(g_log_handle, "Time: ", TimeToString(TimeCurrent()));
          FileWrite(g_log_handle, "Symbol: ", _Symbol);
          FileWrite(g_log_handle, "Initial Balance: ", g_initial_balance);
-         FileClose(g_log_handle);
+         FileFlush(g_log_handle);
       }
    }
    
@@ -194,8 +247,7 @@ void OnDeinit(const int reason)
    // Final statistics
    if(InpPrintLog)
    {
-      g_log_handle = FileOpen(InpLogFile, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
-      if(g_log_handle != INVALID_HANDLE)
+      if(EnsureLogHandle())
       {
          FileSeek(g_log_handle, 0, SEEK_END);
          FileWrite(g_log_handle, "\n=== SafeScalper V23 Stopped ===");
@@ -206,7 +258,9 @@ void OnDeinit(const int reason)
          FileWrite(g_log_handle, "Total Profit: ", g_total_profit);
          FileWrite(g_log_handle, "Total Loss: ", g_total_loss);
          FileWrite(g_log_handle, "Net P&L: ", g_total_profit + g_total_loss);
+         FileFlush(g_log_handle);
          FileClose(g_log_handle);
+         g_log_handle = INVALID_HANDLE;
       }
    }
    
@@ -242,8 +296,8 @@ void OnTick()
    if(CountOwnPositions() >= InpMaxPositions) return;
    
    // Get indicator data with VALIDATION
-   if(CopyBuffer(h_ema_fast, 0, 0, 3, buf_ema_fast) < 3) return;
-   if(CopyBuffer(h_ema_slow, 0, 0, 10, buf_ema_slow) < 10) return;
+   if(CopyBuffer(h_ema_fast, 0, 0, 2, buf_ema_fast) < 2) return;
+   if(CopyBuffer(h_ema_slow, 0, 0, 4, buf_ema_slow) < 4) return;
    if(CopyBuffer(h_adx, 0, 0, 1, buf_adx) < 1) return;
    if(CopyBuffer(h_rsi, 0, 0, 1, buf_rsi) < 1) return;
    
@@ -389,16 +443,13 @@ bool IsNewsTime()
    datetime t1 = now - InpNewsAfterMins * 60;
    datetime t2 = now + InpNewsBeforeMins * 60;
    
-   // IMPROVED: Extract currency properly
-   string currency = "";
-   if(StringLen(_Symbol) >= 6)
-      currency = StringSubstr(_Symbol, 0, 3); // EUR from EURUSD
-   
-   // Handle special symbols
-   if(StringFind(_Symbol, "XAU") >= 0 || StringFind(_Symbol, "GOLD") >= 0)
-      currency = "USD";
-   if(StringFind(_Symbol, "BTC") >= 0 || StringFind(_Symbol, "ETH") >= 0)
-      currency = "USD";
+   // Use cached currency to reduce string ops
+   string currency = g_news_currency;
+   if(currency == "")
+   {
+      InitNewsCurrency();
+      currency = g_news_currency;
+   }
    
    if(CalendarValueHistory(values, t1, t2) > 0)
    {
@@ -432,6 +483,17 @@ bool IsNewsTime()
 void ManageOpenPositions(double atr)
 {
    if(atr <= 0) return; // Prevent errors
+
+   double partial_trigger = atr * InpPartial_ATR;
+   double be_trigger = atr * InpBE_Trigger_ATR;
+   double trail_dist = atr * InpTrail_Step_ATR;
+   double min_vol = g_min_volume;
+   if(min_vol <= 0)
+   {
+      min_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      if(min_vol > 0)
+         g_min_volume = min_vol;
+   }
    
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -445,23 +507,21 @@ void ManageOpenPositions(double atr)
       double volume = m_position.Volume();
       ulong ticket = m_position.Ticket();
       string comment = m_position.Comment();
+      double tp = m_position.TakeProfit();
+      ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)m_position.PositionType();
+      bool can_partial = InpUsePartial && StringFind(comment, "Partial") < 0;
       
-      double partial_trigger = atr * InpPartial_ATR;
-      double be_trigger = atr * InpBE_Trigger_ATR;
-      double trail_dist = atr * InpTrail_Step_ATR;
-      
-      if(m_position.PositionType() == POSITION_TYPE_BUY)
+      if(position_type == POSITION_TYPE_BUY)
       {
          double profit_distance = current_price - entry;
          
          // Partial close (IMPROVED with proper validation)
-         if(InpUsePartial && StringFind(comment, "Partial") < 0)
+         if(can_partial)
          {
             if(profit_distance >= partial_trigger)
             {
                double vol_to_close = NormalizeVolume(volume * InpPartialPercent / 100.0);
                double vol_remaining = volume - vol_to_close;
-               double min_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
                
                // FIXED: Check if remaining volume is valid
                if(vol_to_close >= min_vol && vol_remaining >= min_vol)
@@ -481,7 +541,7 @@ void ManageOpenPositions(double atr)
             // Move to break-even first
             if(profit_distance >= be_trigger && (sl < entry || sl == 0))
             {
-               if(m_trade.PositionModify(ticket, entry, m_position.TakeProfit()))
+               if(m_trade.PositionModify(ticket, entry, tp))
                   LogMessage("🎯 Break-Even: " + IntegerToString(ticket));
             }
             
@@ -489,23 +549,22 @@ void ManageOpenPositions(double atr)
             double new_sl = current_price - trail_dist;
             if(new_sl > sl && new_sl > entry)
             {
-               if(m_trade.PositionModify(ticket, new_sl, m_position.TakeProfit()))
+               if(m_trade.PositionModify(ticket, new_sl, tp))
                   LogMessage("📈 Trailing SL: " + DoubleToString(new_sl, _Digits));
             }
          }
       }
-      else if(m_position.PositionType() == POSITION_TYPE_SELL)
+      else if(position_type == POSITION_TYPE_SELL)
       {
          double profit_distance = entry - current_price;
          
          // Partial close
-         if(InpUsePartial && StringFind(comment, "Partial") < 0)
+         if(can_partial)
          {
             if(profit_distance >= partial_trigger)
             {
                double vol_to_close = NormalizeVolume(volume * InpPartialPercent / 100.0);
                double vol_remaining = volume - vol_to_close;
-               double min_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
                
                if(vol_to_close >= min_vol && vol_remaining >= min_vol)
                {
@@ -523,14 +582,14 @@ void ManageOpenPositions(double atr)
          {
             if(profit_distance >= be_trigger && (sl > entry || sl == 0))
             {
-               if(m_trade.PositionModify(ticket, entry, m_position.TakeProfit()))
+               if(m_trade.PositionModify(ticket, entry, tp))
                   LogMessage("🎯 Break-Even: " + IntegerToString(ticket));
             }
             
             double new_sl = current_price + trail_dist;
             if((new_sl < sl || sl == 0) && new_sl < entry)
             {
-               if(m_trade.PositionModify(ticket, new_sl, m_position.TakeProfit()))
+               if(m_trade.PositionModify(ticket, new_sl, tp))
                   LogMessage("📉 Trailing SL: " + DoubleToString(new_sl, _Digits));
             }
          }
@@ -549,24 +608,44 @@ double CalculatePositionSize(double sl_points)
    double risk_money = balance * (InpRiskPercent / 100.0);
    
    // Get tick value with validation
-   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_value = g_tick_value;
+   if(tick_value <= 0)
+   {
+      tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      g_tick_value = tick_value;
+   }
    if(tick_value <= 0)
    {
       LogMessage("⚠️ Invalid tick value");
-      return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      return (g_min_volume > 0.0) ? g_min_volume : SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    }
    
    // Calculate lot size
    double lot = risk_money / (sl_points * tick_value);
    
    // Normalize to broker's lot step
-   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double step = g_volume_step;
+   if(step <= 0)
+   {
+      step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      g_volume_step = step;
+   }
    if(step > 0)
       lot = MathFloor(lot / step) * step;
    
    // Apply limits
-   double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double min_lot = g_min_volume;
+   double max_lot = g_max_volume;
+   if(min_lot <= 0)
+   {
+      min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      g_min_volume = min_lot;
+   }
+   if(max_lot <= 0)
+   {
+      max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+      g_max_volume = max_lot;
+   }
    
    if(lot < min_lot) lot = min_lot;
    if(lot > max_lot) lot = max_lot;
@@ -683,9 +762,28 @@ int CountOwnPositions()
 //+------------------------------------------------------------------+
 double NormalizeVolume(double volume)
 {
-   double min_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double max_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double min_vol = g_min_volume;
+   double max_vol = g_max_volume;
+   double step = g_volume_step;
+   
+   if(min_vol <= 0)
+   {
+      min_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      if(min_vol > 0)
+         g_min_volume = min_vol;
+   }
+   if(max_vol <= 0)
+   {
+      max_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+      if(max_vol > 0)
+         g_max_volume = max_vol;
+   }
+   if(step <= 0)
+   {
+      step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      if(step > 0)
+         g_volume_step = step;
+   }
    
    if(step > 0)
       volume = MathFloor(volume / step) * step;
@@ -709,12 +807,10 @@ void LogMessage(string message)
    Print(full_message);
    
    // Write to file
-   g_log_handle = FileOpen(InpLogFile, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
-   if(g_log_handle != INVALID_HANDLE)
+   if(EnsureLogHandle())
    {
-      FileSeek(g_log_handle, 0, SEEK_END);
       FileWrite(g_log_handle, full_message);
-      FileClose(g_log_handle);
+      FileFlush(g_log_handle);
    }
 }
 //+------------------------------------------------------------------+
